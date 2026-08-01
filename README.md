@@ -67,6 +67,7 @@ codex-mv [options] OLD_PATH NEW_PATH
 | `-n`, `--dry-run` | Show the plan — including which sessions would be repointed — and change nothing |
 | `-y`, `--yes` | Skip the confirmation prompt |
 | `--codex-home PATH` | Use `PATH` instead of `$CODEX_HOME` / `~/.codex` |
+| `--undo DIR` | Reverse a previous run, using the backup directory it printed |
 | `--no-backup` | Skip the pre-flight backup (not recommended) |
 | `--no-color` | Disable coloured output |
 | `-h`, `--help` | Show help |
@@ -100,9 +101,20 @@ So `codex-mv`:
 
 1. **Refuses to run** if a Codex process is working inside the target directory,
    naming the offending pids.
-2. **Backs up first** — the state DB (plus `-wal`/`-shm`), `config.toml`, and
-   every rollout it is about to touch — into
-   `~/.codex/.codex-mv-backups/<timestamp>/`, and prints the path.
+2. **Records how to reverse itself first**, into
+   `~/.codex/.codex-mv-backups/<timestamp>/`, and prints the path. The state DB
+   (plus `-wal`/`-shm`) and `config.toml` are copied in full; the sessions are
+   captured as a `manifest.json` listing each rollout and its original `cwd`.
+
+   Transcripts are deliberately *not* copied. Only one field on line 1 changes,
+   and rollouts are written atomically, so a full copy protects against nothing
+   the manifest does not — and on a real project the difference is large: 110
+   sessions of chat history is ~570 MB, against a manifest of a few tens of KB.
+
+   Reverse a run with `codex-mv --undo ~/.codex/.codex-mv-backups/<timestamp>`.
+   It restores each session's recorded `cwd` exactly, moves the directory back,
+   and remaps the state DB and trust entry — remapping rather than restoring the
+   copies, so unrelated work done since the rename is not discarded.
 3. **Writes atomically**, via a temp file and `os.replace`, so an interrupted run
    cannot leave a half-written rollout.
 4. Refuses identical paths, a missing source, an existing destination, or a
@@ -140,7 +152,10 @@ writes your real `~/.codex`. Two layers:
 `tests/make-fixture.py`. This matters: Codex falls back to empty metadata when a
 `session_meta` record fails to deserialise, so a hand-written stand-in quietly
 tests the failure path instead. Re-run `./tests/make-fixture.py` if a Codex
-upgrade changes that schema.
+upgrade changes that schema. The committed fixture keeps only the *shape* Codex
+needs to parse: the verbose `base_instructions` text is replaced with a
+placeholder, and identifiers are templated, so no captured session content is
+carried in this repo.
 
 ### What is verified, and what is not
 
@@ -150,13 +165,17 @@ Verified automatically, on every run:
 - subdirectory sessions are remapped; sibling paths sharing a prefix are not
 - dry run changes nothing (checked by checksum)
 - the live-session guard refuses a real run and only warns on a dry run
+- the backup records a reversible manifest rather than copying transcripts
+- **`--undo` puts everything back**: directory, every session's recorded `cwd`,
+  the state DB rows, and the trust entry
 - **the renamed project's sessions come back from `thread/list`**, through both
   the default scan-and-repair path and `useStateDbOnly` — driven against a real
   `codex app-server`
 
 The suite has been mutation-tested: skipping the sqlite update, skipping the
-rollout rewrite, dropping the path-separator boundary check, and rewriting the
-whole file each cause failures in the tests that should catch them.
+rollout rewrite, dropping the path-separator boundary check, rewriting the whole
+file, breaking the undo restore, and recording the wrong `cwd` in the manifest
+each cause failures in the tests that should catch them.
 
 Verified once, by hand, not automated:
 

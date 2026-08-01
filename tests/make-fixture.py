@@ -99,6 +99,15 @@ def main():
         blob = blob.replace(proj, "{{CWD}}").replace(tid, "{{SESSION_ID}}")
         meta = json.loads(blob)
 
+        # Only the record's *shape* matters for the repair to deserialise, so
+        # drop the bulky vendor prompt text and any residual identifier rather
+        # than committing captured session content to a public repo.
+        payload = meta.get("payload") or {}
+        if isinstance(payload.get("base_instructions"), dict):
+            payload["base_instructions"] = {"text": "{{BASE_INSTRUCTIONS}}"}
+        if isinstance(payload.get("context_window"), dict):
+            payload["context_window"] = {"window_id": "{{WINDOW_ID}}"}
+
         os.makedirs(FIXTURES, exist_ok=True)
         with open(TARGET, "w", encoding="utf-8") as fh:
             json.dump(meta, fh, indent=1, sort_keys=True)

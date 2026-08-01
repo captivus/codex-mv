@@ -69,6 +69,8 @@ def session_meta_record(session_id, cwd):
         blob = fh.read()
     blob = blob.replace("{{CWD}}", json.dumps(cwd)[1:-1])
     blob = blob.replace("{{SESSION_ID}}", session_id)
+    blob = blob.replace("{{WINDOW_ID}}", "019f0000-0000-7000-8000-0000000000ff")
+    blob = blob.replace("{{BASE_INSTRUCTIONS}}", "test base instructions")
     return json.loads(blob)
 
 
@@ -317,21 +319,69 @@ class StructuralTests(unittest.TestCase):
         self.assertEqual(open(f.config, encoding="utf-8").read(), before["cfg"])
         self.assertIn("Dry-run complete", r.stderr)
 
-    def test_backup_is_written(self):
-        f = Fixture(self.tmp)
-        f.run()
+    def backup_dir(self, f):
         root = os.path.join(f.home, ".codex-mv-backups")
-        self.assertTrue(os.path.isdir(root))
+        self.assertTrue(os.path.isdir(root), "no backup directory")
         stamps = os.listdir(root)
         self.assertEqual(len(stamps), 1)
-        backup = os.path.join(root, stamps[0])
+        return os.path.join(root, stamps[0])
+
+    def test_backup_records_a_manifest_not_transcript_copies(self):
+        f = Fixture(self.tmp)
+        f.run()
+        backup = self.backup_dir(f)
+
+        with open(os.path.join(backup, "manifest.json"), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest["version"], 1)
+        self.assertEqual(manifest["old_path"], f.old)
+        self.assertEqual(manifest["new_path"], f.new)
+        self.assertEqual(len(manifest["rollouts"]), 1)
+        # the manifest must hold the ORIGINAL cwd, so the edit can be reversed
+        self.assertEqual(manifest["rollouts"][0]["cwd"], f.session_cwd)
+        self.assertEqual(manifest["rollouts"][0]["path"], f.rollout)
+
         self.assertTrue(os.path.exists(os.path.join(backup, "state_5.sqlite")))
         self.assertTrue(os.path.exists(os.path.join(backup, "config.toml")))
-        saved = os.listdir(os.path.join(backup, "sessions"))
-        self.assertEqual(len(saved), 1)
-        # the backed-up copy must still hold the ORIGINAL path
-        self.assertEqual(
-            meta_cwd(os.path.join(backup, "sessions", saved[0])), f.old)
+
+        # transcripts must NOT be copied: on a real project that is ~570 MB
+        self.assertFalse(os.path.exists(os.path.join(backup, "sessions")))
+        total = sum(os.path.getsize(os.path.join(backup, n))
+                    for n in os.listdir(backup))
+        self.assertLess(total, os.path.getsize(f.rollout) + 200_000,
+                        "backup should not scale with transcript size")
+
+    def test_undo_restores_everything(self):
+        f = Fixture(self.tmp)
+        before_cfg = open(f.config, encoding="utf-8").read()
+        f.run()
+        backup = self.backup_dir(f)
+
+        r = run_codex_mv("--undo", backup, "-y", "--no-color")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        self.assertTrue(os.path.isdir(f.old), "directory should be back")
+        self.assertFalse(os.path.exists(f.new))
+        self.assertTrue(os.path.exists(os.path.join(f.old, "marker.txt")))
+        self.assertEqual(meta_cwd(f.rollout), f.session_cwd)
+        self.assertEqual(db_cwds(f.db), [f.session_cwd])
+        self.assertEqual(open(f.config, encoding="utf-8").read(), before_cfg)
+
+    def test_undo_restores_subdirectory_sessions(self):
+        f = Fixture(self.tmp, sub="nested/deeper")
+        f.run()
+        backup = self.backup_dir(f)
+        r = run_codex_mv("--undo", backup, "-y", "--no-color")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(meta_cwd(f.rollout), f.session_cwd)
+        self.assertEqual(db_cwds(f.db), [f.session_cwd])
+
+    def test_undo_refuses_without_a_manifest(self):
+        empty = os.path.join(self.tmp, "not-a-backup")
+        os.makedirs(empty, exist_ok=True)
+        r = run_codex_mv("--undo", empty, "-y", "--no-color")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("No manifest.json", r.stderr)
 
     def test_refuses_when_codex_is_live_in_the_project(self):
         f = Fixture(self.tmp)

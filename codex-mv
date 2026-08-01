@@ -8,6 +8,8 @@ Usage:
 
 Options:
   -n, --dry-run           Show what would be done, but don't make any changes.
+      --undo DIR          Reverse a previous run, using the backup directory
+                          it printed.
   -y, --yes               Skip the confirmation prompt (assume "yes").
       --codex-home PATH   Use PATH instead of $CODEX_HOME / ~/.codex.
       --no-backup         Skip the pre-flight backup (not recommended).
@@ -194,8 +196,11 @@ def live_codex_processes(target):
 
 
 # ------------------------------------------------------------------ edits ----
-def rewrite_rollout(path, old, new):
-    """Rewrite session_meta.cwd only; the transcript body is left untouched.
+def _rewrite_meta(path, pick):
+    """Stream the rollout, letting `pick(cwd)` supply a replacement cwd.
+
+    `pick` returns the new value, or None to leave the record alone. Only
+    session_meta is considered; the transcript body is copied verbatim.
 
     Verified: on resume Codex injects a fresh <environment_context> announcing
     the current directory, so stale paths in the body are historical record and
@@ -218,8 +223,9 @@ def rewrite_rollout(path, old, new):
                         if obj is not None and obj.get("type") == "session_meta":
                             payload = obj.get("payload") or {}
                             cwd = payload.get("cwd")
-                            if isinstance(cwd, str) and is_under(cwd, old):
-                                payload["cwd"] = remap(cwd, old, new)
+                            replacement = pick(cwd) if isinstance(cwd, str) else None
+                            if replacement is not None:
+                                payload["cwd"] = replacement
                                 obj["payload"] = payload
                                 out.write(json.dumps(obj) + "\n")
                                 changed = True
@@ -232,6 +238,17 @@ def rewrite_rollout(path, old, new):
             os.unlink(tmp)
         raise
     return changed
+
+
+def rewrite_rollout(path, old, new):
+    """Repoint a session from under `old` to under `new`."""
+    return _rewrite_meta(
+        path, lambda cwd: remap(cwd, old, new) if is_under(cwd, old) else None)
+
+
+def set_rollout_cwd(path, value):
+    """Set a session's recorded cwd to exactly `value` (used by --undo)."""
+    return _rewrite_meta(path, lambda cwd: value if cwd != value else None)
 
 
 def db_rows_to_update(db, old):
@@ -318,6 +335,122 @@ def update_config(config_path, old, new):
     return count
 
 
+# ----------------------------------------------------------------- backup ----
+MANIFEST_VERSION = 1
+
+
+def write_backup(home, old, new, rollouts, db, config_path, trust):
+    """Record enough to reverse the edit, without copying whole transcripts.
+
+    Only one field on line 1 of each rollout changes, and rollouts are written
+    atomically (temp file + os.replace), so a copy of the full transcript
+    protects against nothing a manifest does not. On a real project that
+    difference is hundreds of megabytes per run: 110 sessions of chat history
+    is ~570 MB, while the manifest describing them is a few tens of kilobytes.
+
+    The state DB and config.toml are small and are copied in full.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = os.path.join(home, ".codex-mv-backups", stamp)
+    os.makedirs(backup_dir, exist_ok=True)
+
+    manifest = {
+        "version": MANIFEST_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "codex_home": home,
+        "old_path": old,
+        "new_path": new,
+        "state_db": os.path.basename(db) if db else None,
+        "config": "config.toml" if trust else None,
+        "rollouts": [{"path": path, "cwd": cwd} for path, cwd in rollouts],
+    }
+    with open(os.path.join(backup_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=1)
+        fh.write("\n")
+
+    if db:
+        for suffix in ("", "-wal", "-shm"):
+            src = db + suffix
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(backup_dir, os.path.basename(src)))
+    if trust:
+        shutil.copy2(config_path, os.path.join(backup_dir, "config.toml"))
+    return backup_dir
+
+
+def undo(backup_dir, out, assume_yes):
+    """Reverse a rename using the manifest written at the time.
+
+    Restores each rollout's recorded cwd rather than remapping paths, so a
+    session that was already somewhere unexpected goes back exactly where it
+    was. The state DB and config are remapped new -> old rather than being
+    overwritten from their copies, so unrelated work done since the rename is
+    not thrown away; the full copies remain in the backup for manual recovery.
+    """
+    manifest_path = os.path.join(backup_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        out.error(f"No manifest.json in {backup_dir}")
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if manifest.get("version") != MANIFEST_VERSION:
+        out.error(f"Unsupported manifest version: {manifest.get('version')}")
+
+    home = manifest["codex_home"]
+    old = manifest["old_path"]
+    new = manifest["new_path"]
+    rollouts = manifest.get("rollouts", [])
+
+    out.info("Planned undo:")
+    out.info(f"  Project dir  : {new} -> {old}")
+    out.info(f"  Sessions     : {len(rollouts)} rollout file(s) to restore")
+
+    live = live_codex_processes(new)
+    if live:
+        out.error(
+            "Codex is running in this project - refusing to touch its data.\n"
+            + "\n".join(f"    pid {pid}: {cmd}" for pid, cmd in live)
+        )
+
+    if not assume_yes:
+        try:
+            reply = input(f"{out.BOLD}Proceed? [y/N] {out.RESET}")
+        except EOFError:
+            reply = ""
+        if reply.strip().lower() not in ("y", "yes"):
+            out.info("Aborted.")
+            return 0
+
+    if os.path.isdir(new) and not os.path.exists(old):
+        shutil.move(new, old)
+        out.success("Project directory moved back.")
+    elif os.path.isdir(old):
+        out.warn(f"{old} already exists - leaving the directory alone.")
+
+    restored, missing = 0, 0
+    for entry in rollouts:
+        path, cwd = entry["path"], entry["cwd"]
+        if not os.path.exists(path):
+            missing += 1
+            continue
+        if set_rollout_cwd(path, cwd):
+            restored += 1
+    out.success(f"Restored {restored} session file(s).")
+    if missing:
+        out.warn(f"{missing} rollout(s) no longer exist and were skipped.")
+
+    db = state_db(home)
+    rows = db_rows_to_update(db, new)
+    if db and rows:
+        out.success(f"Reverted {update_db(db, rows, new, old)} thread row(s).")
+
+    config_path = os.path.join(home, "config.toml")
+    if config_entries(config_path, new):
+        out.success(f"Reverted {update_config(config_path, new, old)} trust entry(ies).")
+
+    out.success("Undo complete.")
+    return 0
+
+
 # ------------------------------------------------------------------- main ----
 def main(argv=None):
     parser = argparse.ArgumentParser(
@@ -329,6 +462,7 @@ def main(argv=None):
     parser.add_argument("-n", "--dry-run", action="store_true")
     parser.add_argument("-y", "--yes", action="store_true")
     parser.add_argument("--codex-home")
+    parser.add_argument("--undo")
     parser.add_argument("--no-backup", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--version", action="store_true")
@@ -343,6 +477,8 @@ def main(argv=None):
     if args.version:
         print(f"codex-mv {VERSION}")
         return 0
+    if args.undo:
+        return undo(abs_path(args.undo), out, args.yes)
     if len(args.paths) != 2:
         print(__doc__.strip())
         return 2
@@ -430,21 +566,7 @@ def main(argv=None):
     # ------------------------------------------------------------ backup ----
     backup_dir = None
     if not args.no_backup and (rollouts or rows or trust):
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_dir = os.path.join(home, ".codex-mv-backups", stamp)
-        os.makedirs(backup_dir, exist_ok=True)
-        if db:
-            for suffix in ("", "-wal", "-shm"):
-                src = db + suffix
-                if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(backup_dir, os.path.basename(src)))
-        if trust:
-            shutil.copy2(config_path, os.path.join(backup_dir, "config.toml"))
-        if rollouts:
-            sess_backup = os.path.join(backup_dir, "sessions")
-            os.makedirs(sess_backup, exist_ok=True)
-            for path, _cwd in rollouts:
-                shutil.copy2(path, os.path.join(sess_backup, os.path.basename(path)))
+        backup_dir = write_backup(home, old, new, rollouts, db, config_path, trust)
         out.success(f"Backup written to {backup_dir}")
 
     # ---------------------------------------------------------- movement ----

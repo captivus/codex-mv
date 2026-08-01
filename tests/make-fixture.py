@@ -7,7 +7,9 @@ A hand-written session_meta is therefore not a faithful fixture: tests built on
 one exercise the repair's failure path instead of its success path.
 
 So we capture a genuine session_meta once, template the values that vary, and
-commit the result. This runs ONE minimal model turn in a throwaway CODEX_HOME.
+commit the result. This starts ONE minimal turn in a throwaway CODEX_HOME --
+enough for Codex to write a rollout, which is all we need; the turn does not
+have to finish, and this script does not wait for a model reply.
 Re-run it when a Codex upgrade changes the session_meta schema.
 
     ./tests/make-fixture.py

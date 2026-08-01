@@ -142,6 +142,38 @@ writes your real `~/.codex`. Two layers:
 tests the failure path instead. Re-run `./tests/make-fixture.py` if a Codex
 upgrade changes that schema.
 
+### What is verified, and what is not
+
+Verified automatically, on every run:
+
+- the three stores are updated, and the transcript body is not
+- subdirectory sessions are remapped; sibling paths sharing a prefix are not
+- dry run changes nothing (checked by checksum)
+- the live-session guard refuses a real run and only warns on a dry run
+- **the renamed project's sessions come back from `thread/list`**, through both
+  the default scan-and-repair path and `useStateDbOnly` — driven against a real
+  `codex app-server`
+
+The suite has been mutation-tested: skipping the sqlite update, skipping the
+rollout rewrite, dropping the path-separator boundary check, and rewriting the
+whole file each cause failures in the tests that should catch them.
+
+Verified once, by hand, not automated:
+
+- that a *resumed* session runs in the new directory and the model is told so.
+  Confirmed against Codex 0.146.0 by renaming a project whose transcript still
+  referenced the old path in 46 places, resuming it, and asking the model where
+  it was. It injected a fresh `<environment_context>` naming the new directory,
+  ran its commands there, and found a file that existed only in the renamed
+  copy.
+
+There is deliberately no automated live end-to-end test. Driving a complete
+session through the app-server needs more of its protocol than this tool
+warrants: `thread/start` creates an in-memory thread with no rollout on disk, so
+it cannot then be resumed, and turn events did not reach a plain stdio client.
+The behaviour above is covered by the manual check; the automated suite covers
+everything that does not require a model call.
+
 ## Compatibility
 
 Developed and verified against **Codex CLI 0.146.0** (state DB `state_5.sqlite`).

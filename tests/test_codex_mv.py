@@ -469,6 +469,124 @@ class StructuralTests(unittest.TestCase):
             proc.kill()
             proc.wait()
 
+    def test_guard_catches_a_session_working_from_another_directory(self):
+        """The state DB is shared, and so is the sessions tree.
+
+        A thread resumed from somewhere else still appends to *this* project's
+        rollout, which is the file about to be rewritten. Working directory
+        alone does not identify it.
+        """
+        f = Fixture(self.tmp)
+        elsewhere = os.path.join(self.tmp, "unrelated")
+        os.makedirs(elsewhere, exist_ok=True)
+        fake_bin = os.path.join(self.tmp, "fakebin3")
+        os.makedirs(fake_bin, exist_ok=True)
+        fake = os.path.join(fake_bin, "codex")
+        # holds THIS project's rollout open, while sitting in another directory
+        with open(fake, "w") as fh:
+            fh.write(f'#!/bin/sh\nexec 3< "{f.rollout}"\nsleep 30\n')
+        os.chmod(fake, 0o755)
+        proc = subprocess.Popen([fake], cwd=elsewhere,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.5)
+            r = f.run()
+            self.assertNotEqual(r.returncode, 0,
+                                "must refuse: that session owns a rollout here")
+            self.assertIn("Codex is running", r.stderr)
+            self.assertEqual(meta_cwd(f.rollout), f.old, "must not have edited")
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_db_update_survives_a_concurrent_writer(self):
+        """Another project's session writes to the same shared database.
+
+        A deferred transaction cannot survive this: it takes a read snapshot
+        and then asks for the write lock, which SQLite refuses immediately
+        rather than waiting.
+        """
+        mod = codex_mv_module()
+        f = Fixture(self.tmp)
+        stop = os.path.join(self.tmp, "stop")
+        hammer = os.path.join(self.tmp, "hammer.py")
+        with open(hammer, "w") as fh:
+            fh.write(
+                "import sqlite3, sys, os, time\n"
+                "db, stop = sys.argv[1], sys.argv[2]\n"
+                "con = sqlite3.connect(db, timeout=30)\n"
+                "n = 0\n"
+                "end = time.time() + 3\n"
+                "while not os.path.exists(stop) and time.time() < end:\n"
+                "    try:\n"
+                "        con.execute('BEGIN IMMEDIATE')\n"
+                "        con.execute('UPDATE threads SET title=? WHERE id=?',\n"
+                "                    (str(n), 'x'))\n"
+                "        con.execute('INSERT OR REPLACE INTO threads"
+                " (id, rollout_path, cwd, title) VALUES (?,?,?,?)',\n"
+                "                    ('x', 'p', '/other', str(n)))\n"
+                "        con.commit()\n"
+                "    except sqlite3.Error:\n"
+                "        pass\n"
+                "    n += 1\n")
+        writers = [subprocess.Popen([sys.executable, hammer, f.db, stop])
+                   for _ in range(2)]
+        try:
+            time.sleep(0.3)
+            rows = mod.db_rows_to_update(f.db, f.old, attempts=4, timeout=5.0)
+            self.assertEqual(len(rows), 1)
+            n = mod.update_db(f.db, rows, f.old, f.new, attempts=5, timeout=5.0)
+            self.assertEqual(n, 1)
+            self.assertIn(f.new, db_cwds(f.db))
+        finally:
+            open(stop, "w").close()
+            for w in writers:
+                w.wait(timeout=15)
+
+    def test_backup_snapshot_is_taken_while_a_writer_is_active(self):
+        """The DB copy must be a real snapshot of a database in use."""
+        mod = codex_mv_module()
+        f = Fixture(self.tmp)
+        stop = os.path.join(self.tmp, "stop2")
+        hammer = os.path.join(self.tmp, "hammer2.py")
+        with open(hammer, "w") as fh:
+            fh.write(
+                "import sqlite3, sys, os, time\n"
+                "db, stop = sys.argv[1], sys.argv[2]\n"
+                "con = sqlite3.connect(db, timeout=30)\n"
+                "n = 0\n"
+                "end = time.time() + 3\n"
+                "while not os.path.exists(stop) and time.time() < end:\n"
+                "    try:\n"
+                "        con.execute('BEGIN IMMEDIATE')\n"
+                "        con.execute('INSERT OR REPLACE INTO threads"
+                " (id, rollout_path, cwd) VALUES (?,?,?)', ('y','p','/other'))\n"
+                "        con.commit()\n"
+                "    except sqlite3.Error:\n"
+                "        pass\n"
+                "    n += 1\n")
+        writer = subprocess.Popen([sys.executable, hammer, f.db, stop])
+        try:
+            time.sleep(0.3)
+            backup = mod.write_backup(
+                f.home, f.old, f.new, [(f.rollout, f.session_cwd)],
+                f.db, f.config, [(0, f.old)])
+            copy = os.path.join(backup, os.path.basename(f.db))
+            self.assertTrue(os.path.exists(copy))
+            con = sqlite3.connect(copy)
+            try:
+                self.assertEqual(
+                    con.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                # the snapshot must carry the rows we need to reverse the rename
+                got = con.execute("SELECT cwd FROM threads WHERE id=?",
+                                  (Fixture.SESSION_ID,)).fetchone()
+                self.assertEqual(got[0], f.session_cwd)
+            finally:
+                con.close()
+        finally:
+            open(stop, "w").close()
+            writer.wait(timeout=15)
+
     def test_refuses_when_codex_is_live_in_the_project(self):
         f = Fixture(self.tmp)
         fake_bin = os.path.join(self.tmp, "fakebin")

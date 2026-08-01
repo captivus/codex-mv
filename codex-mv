@@ -37,6 +37,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from datetime import datetime
 
 VERSION = "1.0.0"
@@ -254,15 +255,23 @@ def live_codex_processes(target):
             cwd = os.path.realpath(f"/proc/{pid}/cwd")
         except OSError:
             cwd = None
-        bound = (cwd and is_under(cwd, target)) or any(
-            is_under(a, target) for a in args if a.startswith("/")
+        rollout = _proc_rollout(pid)
+        # A session's working directory is not the only way it can belong to
+        # this project: a thread resumed from elsewhere still appends to *this
+        # project's* rollout, and that file is about to be rewritten. Treat the
+        # rollout it holds open as authoritative alongside the cwd.
+        rollout_cwd = session_meta_cwd(rollout) if rollout else None
+        bound = (
+            (cwd and is_under(cwd, target))
+            or (rollout_cwd and is_under(rollout_cwd, target))
+            or any(is_under(a, target) for a in args if a.startswith("/"))
         )
         if bound:
             ppid, tty = _proc_stat(pid)
             found.append({
                 "pid": pid, "ppid": ppid, "tty": tty, "cwd": cwd,
                 "cmd": " ".join(args),
-                "rollout": _proc_rollout(pid),
+                "rollout": rollout,
                 "started": _start_time(pid),
             })
     return found
@@ -424,7 +433,7 @@ def set_rollout_cwd(path, value):
     return _rewrite_meta(path, lambda cwd: value if cwd != value else None)
 
 
-def db_rows_to_update(db, old):
+def db_rows_to_update(db, old, attempts=6, timeout=30.0):
     """Rows whose cwd is at or under `old`.
 
     Matching is done in Python rather than SQL LIKE so that %, _ and other
@@ -432,30 +441,69 @@ def db_rows_to_update(db, old):
     """
     if not db or not os.path.exists(db):
         return []
-    con = sqlite3.connect(db)
-    try:
-        con.row_factory = sqlite3.Row
+    # The DB is shared with every other project, so this read contends with
+    # live sessions. A lock here must never be mistaken for "no rows": that
+    # would silently skip the database and report success having changed
+    # nothing. Retry, and let a genuine failure surface.
+    delay = 0.25
+    for attempt in range(attempts):
+        con = sqlite3.connect(db, timeout=timeout)
         try:
+            con.row_factory = sqlite3.Row
             rows = con.execute("SELECT id, cwd FROM threads").fetchall()
-        except sqlite3.Error:
-            return []
-        return [(r["id"], r["cwd"]) for r in rows
-                if isinstance(r["cwd"], str) and is_under(r["cwd"], old)]
-    finally:
-        con.close()
+            return [(r["id"], r["cwd"]) for r in rows
+                    if isinstance(r["cwd"], str) and is_under(r["cwd"], old)]
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return []
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 4.0)
+        finally:
+            con.close()
+    return []
 
 
-def update_db(db, rows, old, new):
-    con = sqlite3.connect(db)
-    try:
-        with con:
+def update_db(db, rows, old, new, attempts=6, timeout=30.0):
+    """Update thread rows, tolerating other Codex sessions writing concurrently.
+
+    The state DB is shared by every project, so a session in an unrelated
+    project is writing to it throughout this call. Two things matter:
+
+    BEGIN IMMEDIATE, not a deferred transaction. A deferred transaction takes a
+    read snapshot and only then asks for the write lock; SQLite cannot make that
+    upgrade wait, because data the reader already saw may have changed, so it
+    returns SQLITE_BUSY *immediately* and the busy timeout never applies.
+    Measured against three concurrent writers, a deferred transaction failed
+    identically at a 5s and a 30s timeout, while BEGIN IMMEDIATE succeeded.
+
+    Retries, because taking the lock up front can still lose to sustained write
+    load; a second attempt normally lands at once.
+    """
+    delay = 0.25
+    for attempt in range(attempts):
+        con = sqlite3.connect(db, timeout=timeout, isolation_level=None)
+        try:
+            con.execute("BEGIN IMMEDIATE")
             for tid, cwd in rows:
                 con.execute(
                     "UPDATE threads SET cwd = ? WHERE id = ?",
                     (remap(cwd, old, new), tid),
                 )
-    finally:
-        con.close()
+            con.execute("COMMIT")
+            return len(rows)
+        except sqlite3.OperationalError:
+            try:
+                con.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 4.0)
+        finally:
+            con.close()
     return len(rows)
 
 
@@ -583,10 +631,20 @@ def write_backup(home, old, new, rollouts, db, config_path, trust):
         fh.write("\n")
 
     if db:
-        for suffix in ("", "-wal", "-shm"):
-            src = db + suffix
-            if os.path.exists(src):
-                shutil.copy2(src, os.path.join(backup_dir, os.path.basename(src)))
+        # SQLite's online backup, not a file copy: the DB is shared with every
+        # other project, so it is being written to while we read it. Copying
+        # the main file and its -wal separately races a checkpoint landing
+        # between the two. (A file copy was consistent in every trial here, but
+        # this is the method designed for a live database and costs nothing.)
+        dest = os.path.join(backup_dir, os.path.basename(db))
+        src_con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30.0)
+        dst_con = sqlite3.connect(dest)
+        try:
+            with dst_con:
+                src_con.backup(dst_con)
+        finally:
+            src_con.close()
+            dst_con.close()
     if trust:
         shutil.copy2(config_path, os.path.join(backup_dir, "config.toml"))
     return backup_dir

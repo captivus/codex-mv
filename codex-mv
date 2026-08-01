@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""codex-mv
+
+Rename a project directory *and* repoint its Codex sessions.
+
+Usage:
+  codex-mv [options] OLD_PATH NEW_PATH
+
+Options:
+  -n, --dry-run           Show what would be done, but don't make any changes.
+  -y, --yes               Skip the confirmation prompt (assume "yes").
+      --codex-home PATH   Use PATH instead of $CODEX_HOME / ~/.codex.
+      --no-backup         Skip the pre-flight backup (not recommended).
+      --no-color          Disable ANSI colour output.
+  -h, --help              Display this help.
+
+Example:
+  codex-mv -y /home/alice/code/project /home/alice/code/project-renamed
+
+Exit status: 0 success, non-zero on error.
+
+Why this is not just "mv":
+  Codex does not store history in a per-project directory. Sessions live in a
+  date-bucketed tree (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl) and each one
+  records the project it belongs to in a `cwd` field inside the file. That value
+  is mirrored into a sqlite cache (state_5.sqlite). `codex resume` filters by cwd,
+  so renaming a project directory orphans its sessions until both are updated.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+from datetime import datetime
+
+VERSION = "1.0.0"
+
+
+# ---------------------------------------------------------------- output ----
+class Out:
+    def __init__(self, color=True):
+        enabled = color and sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+        self.RED = "\033[31m" if enabled else ""
+        self.GREEN = "\033[32m" if enabled else ""
+        self.YELLOW = "\033[33m" if enabled else ""
+        self.CYAN = "\033[36m" if enabled else ""
+        self.BOLD = "\033[1m" if enabled else ""
+        self.RESET = "\033[0m" if enabled else ""
+
+    def info(self, msg):
+        print(f"{self.CYAN}{msg}{self.RESET}", file=sys.stderr)
+
+    def warn(self, msg):
+        print(f"{self.YELLOW}! {msg}{self.RESET}", file=sys.stderr)
+
+    def success(self, msg):
+        print(f"{self.GREEN}+ {msg}{self.RESET}", file=sys.stderr)
+
+    def error(self, msg, code=1):
+        print(f"{self.RED}x {msg}{self.RESET}", file=sys.stderr)
+        sys.exit(code)
+
+
+# ------------------------------------------------------------- path utils ----
+def abs_path(p):
+    return os.path.abspath(os.path.expanduser(str(p).rstrip("/") or "/"))
+
+
+def is_under(path, base):
+    """True if `path` is `base` itself or lives inside it.
+
+    The separator check matters: /a/project-other must not count as being
+    under /a/project.
+    """
+    return path == base or path.startswith(base + os.sep)
+
+
+def remap(path, old, new):
+    """Rewrite `path` from under `old` to under `new`, preserving any subpath."""
+    if path == old:
+        return new
+    if is_under(path, old):
+        return new + path[len(old):]
+    return path
+
+
+# ----------------------------------------------------------- codex layout ----
+def default_codex_home():
+    env = os.environ.get("CODEX_HOME")
+    if env:
+        return abs_path(env)
+    return abs_path(os.path.join(os.path.expanduser("~"), ".codex"))
+
+
+def state_db(codex_home):
+    """Newest state_N.sqlite in the Codex home, or None.
+
+    The filename is versioned (state_5.sqlite today) and bumps between Codex
+    releases, so pick the highest N rather than hardcoding one.
+    """
+    best, best_n = None, -1
+    try:
+        entries = os.listdir(codex_home)
+    except OSError:
+        return None
+    for name in entries:
+        m = re.fullmatch(r"state_(\d+)\.sqlite", name)
+        if m and int(m.group(1)) > best_n:
+            best, best_n = os.path.join(codex_home, name), int(m.group(1))
+    return best
+
+
+def rollout_files(codex_home):
+    sessions = os.path.join(codex_home, "sessions")
+    if not os.path.isdir(sessions):
+        return
+    for root, _dirs, files in os.walk(sessions):
+        for name in sorted(files):
+            if name.endswith(".jsonl"):
+                yield os.path.join(root, name)
+
+
+def session_meta_cwd(path, max_scan=10):
+    """Read the session's recorded cwd.
+
+    session_meta is normally the first line; scan a few in case that changes.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= max_scan:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if obj.get("type") == "session_meta":
+                    payload = obj.get("payload") or {}
+                    cwd = payload.get("cwd")
+                    return cwd if isinstance(cwd, str) else None
+    except OSError:
+        return None
+    return None
+
+
+# --------------------------------------------------------- live processes ----
+def live_codex_processes(target):
+    """Codex processes currently working inside `target`.
+
+    Codex writes to the state DB and appends to rollout files continuously, so
+    editing those while a session is live risks losing or corrupting writes.
+    """
+    found = []
+    if not os.path.isdir("/proc"):
+        return found
+    self_pid = os.getpid()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == self_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            continue
+        args = [a.decode("utf-8", "replace") for a in argv if a]
+        if not args:
+            continue
+        # only consider actual codex processes, not shells that mention it
+        exe_name = os.path.basename(args[0])
+        if "codex" not in exe_name and not any(
+            os.path.basename(a) == "codex" for a in args[:2]
+        ):
+            continue
+        try:
+            cwd = os.path.realpath(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = None
+        bound = (cwd and is_under(cwd, target)) or any(
+            is_under(a, target) for a in args if a.startswith("/")
+        )
+        if bound:
+            found.append((pid, " ".join(args)[:110]))
+    return found
+
+
+# ------------------------------------------------------------------ edits ----
+def rewrite_rollout(path, old, new):
+    """Rewrite session_meta.cwd only; the transcript body is left untouched.
+
+    Verified: on resume Codex injects a fresh <environment_context> announcing
+    the current directory, so stale paths in the body are historical record and
+    do not affect where the resumed session operates. Rewriting them would
+    falsify the transcript for no benefit.
+    """
+    changed = False
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".codex-mv-", suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped:
+                        try:
+                            obj = json.loads(stripped)
+                        except (ValueError, TypeError):
+                            obj = None
+                        if obj is not None and obj.get("type") == "session_meta":
+                            payload = obj.get("payload") or {}
+                            cwd = payload.get("cwd")
+                            if isinstance(cwd, str) and is_under(cwd, old):
+                                payload["cwd"] = remap(cwd, old, new)
+                                obj["payload"] = payload
+                                out.write(json.dumps(obj) + "\n")
+                                changed = True
+                                continue
+                    out.write(line if line.endswith("\n") else line + "\n")
+        shutil.copystat(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return changed
+
+
+def db_rows_to_update(db, old):
+    """Rows whose cwd is at or under `old`.
+
+    Matching is done in Python rather than SQL LIKE so that %, _ and other
+    glob-significant characters in real paths cannot corrupt the match.
+    """
+    if not db or not os.path.exists(db):
+        return []
+    con = sqlite3.connect(db)
+    try:
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute("SELECT id, cwd FROM threads").fetchall()
+        except sqlite3.Error:
+            return []
+        return [(r["id"], r["cwd"]) for r in rows
+                if isinstance(r["cwd"], str) and is_under(r["cwd"], old)]
+    finally:
+        con.close()
+
+
+def update_db(db, rows, old, new):
+    con = sqlite3.connect(db)
+    try:
+        with con:
+            for tid, cwd in rows:
+                con.execute(
+                    "UPDATE threads SET cwd = ? WHERE id = ?",
+                    (remap(cwd, old, new), tid),
+                )
+    finally:
+        con.close()
+    return len(rows)
+
+
+CONFIG_HEADER = re.compile(r'^(\s*\[projects\.")(.*)("\]\s*)$')
+
+
+def config_entries(config_path, old):
+    """Project trust entries at or under `old`, as (lineno, path) pairs."""
+    hits = []
+    if not os.path.exists(config_path):
+        return hits
+    try:
+        with open(config_path, "r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                m = CONFIG_HEADER.match(line.rstrip("\n"))
+                if m and is_under(m.group(2), old):
+                    hits.append((i, m.group(2)))
+    except OSError:
+        return []
+    return hits
+
+
+def update_config(config_path, old, new):
+    """Rewrite only the [projects."..."] header lines.
+
+    Deliberately a targeted line edit rather than a parse-and-reserialise:
+    config.toml holds unrelated user settings, comments and formatting that a
+    round-trip would discard.
+    """
+    with open(config_path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    count = 0
+    for i, line in enumerate(lines):
+        m = CONFIG_HEADER.match(line.rstrip("\n"))
+        if m and is_under(m.group(2), old):
+            lines[i] = f"{m.group(1)}{remap(m.group(2), old, new)}{m.group(3)}\n"
+            count += 1
+    if count:
+        directory = os.path.dirname(config_path) or "."
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".codex-mv-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.writelines(lines)
+            shutil.copystat(config_path, tmp)
+            os.replace(tmp, config_path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    return count
+
+
+# ------------------------------------------------------------------- main ----
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="codex-mv",
+        description="Rename a project directory and repoint its Codex sessions.",
+        add_help=False,
+    )
+    parser.add_argument("paths", nargs="*")
+    parser.add_argument("-n", "--dry-run", action="store_true")
+    parser.add_argument("-y", "--yes", action="store_true")
+    parser.add_argument("--codex-home")
+    parser.add_argument("--no-backup", action="store_true")
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args(argv)
+
+    out = Out(color=not args.no_color)
+
+    if args.help:
+        print(__doc__.strip())
+        return 0
+    if args.version:
+        print(f"codex-mv {VERSION}")
+        return 0
+    if len(args.paths) != 2:
+        print(__doc__.strip())
+        return 2
+
+    old = abs_path(args.paths[0])
+    new = abs_path(args.paths[1])
+    home = abs_path(args.codex_home) if args.codex_home else default_codex_home()
+
+    # ------------------------------------------------------- validation ----
+    if old == new:
+        out.error("OLD_PATH and NEW_PATH are identical.")
+    if not os.path.isdir(old):
+        out.error(f"Source directory not found: {old}")
+    if os.path.exists(new):
+        out.error(f"Destination already exists: {new}")
+    if is_under(new, old):
+        out.error("NEW_PATH cannot be inside OLD_PATH.")
+    if not os.path.isdir(home):
+        out.warn(f"No Codex home at {home} - only the directory will be renamed.")
+
+    # ------------------------------------------------ live-session guard ----
+    live = live_codex_processes(old)
+    if live:
+        out.error(
+            "Codex is running in this project - refusing to touch its data.\n"
+            + "\n".join(f"    pid {pid}: {cmd}" for pid, cmd in live)
+            + "\n  Close those sessions and try again."
+        )
+
+    # ------------------------------------------------------- gather work ----
+    rollouts = []
+    for path in rollout_files(home):
+        cwd = session_meta_cwd(path)
+        if cwd and is_under(cwd, old):
+            rollouts.append((path, cwd))
+
+    db = state_db(home)
+    rows = db_rows_to_update(db, old)
+    config_path = os.path.join(home, "config.toml")
+    trust = config_entries(config_path, old)
+
+    # ------------------------------------------------------------ report ----
+    out.info("Planned actions:")
+    out.info(f"  Project dir  : {old} -> {new}")
+    if rollouts:
+        out.info(f"  Sessions     : {len(rollouts)} rollout file(s) to repoint")
+        for path, cwd in rollouts[:10]:
+            out.info(f"                 {os.path.basename(path)}  ({cwd})")
+        if len(rollouts) > 10:
+            out.info(f"                 ... and {len(rollouts) - 10} more")
+    else:
+        out.warn(f"No Codex sessions recorded for {old}")
+    if db:
+        out.info(f"  State DB     : {len(rows)} thread row(s) in {os.path.basename(db)}")
+    if trust:
+        out.info(f"  Trust entries: {len(trust)} in config.toml")
+    else:
+        out.warn(
+            "No project trust entry in config.toml - after the rename Codex "
+            "will treat this directory as untrusted (read-only sandbox) "
+            "until you approve it again."
+        )
+
+    if args.dry_run:
+        out.info("Dry-run complete - no changes made.")
+        return 0
+
+    if not args.yes:
+        try:
+            reply = input(f"{out.BOLD}Proceed? [y/N] {out.RESET}")
+        except EOFError:
+            reply = ""
+        if reply.strip().lower() not in ("y", "yes"):
+            out.info("Aborted.")
+            return 0
+
+    # ------------------------------------------------------------ backup ----
+    backup_dir = None
+    if not args.no_backup and (rollouts or rows or trust):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = os.path.join(home, ".codex-mv-backups", stamp)
+        os.makedirs(backup_dir, exist_ok=True)
+        if db:
+            for suffix in ("", "-wal", "-shm"):
+                src = db + suffix
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(backup_dir, os.path.basename(src)))
+        if trust:
+            shutil.copy2(config_path, os.path.join(backup_dir, "config.toml"))
+        if rollouts:
+            sess_backup = os.path.join(backup_dir, "sessions")
+            os.makedirs(sess_backup, exist_ok=True)
+            for path, _cwd in rollouts:
+                shutil.copy2(path, os.path.join(sess_backup, os.path.basename(path)))
+        out.success(f"Backup written to {backup_dir}")
+
+    # ---------------------------------------------------------- movement ----
+    # If the shell is sitting inside the directory being renamed, step out.
+    try:
+        here = os.path.realpath(os.getcwd())
+    except OSError:
+        here = None
+    if here and is_under(here, old):
+        os.chdir("/")
+
+    try:
+        shutil.move(old, new)
+    except OSError as exc:
+        out.error(f"Could not rename project directory: {exc}")
+    out.success("Project directory renamed.")
+
+    # ------------------------------------------------------------- edits ----
+    try:
+        changed = sum(1 for path, _cwd in rollouts if rewrite_rollout(path, old, new))
+        if changed:
+            out.success(f"Repointed {changed} session file(s).")
+        if db and rows:
+            out.success(f"Updated {update_db(db, rows, old, new)} thread row(s).")
+        if trust:
+            out.success(f"Migrated {update_config(config_path, old, new)} trust entry(ies).")
+    except Exception as exc:  # noqa: BLE001 - report and point at the backup
+        msg = f"Failed while updating Codex metadata: {exc}"
+        if backup_dir:
+            msg += f"\n  Originals are in {backup_dir}"
+        out.error(msg)
+
+    out.success("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

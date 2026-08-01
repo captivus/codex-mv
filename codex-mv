@@ -364,13 +364,21 @@ def main(argv=None):
         out.warn(f"No Codex home at {home} - only the directory will be renamed.")
 
     # ------------------------------------------------ live-session guard ----
+    # A dry run writes nothing, so a live session is only a warning there.
     live = live_codex_processes(old)
     if live:
-        out.error(
-            "Codex is running in this project - refusing to touch its data.\n"
-            + "\n".join(f"    pid {pid}: {cmd}" for pid, cmd in live)
-            + "\n  Close those sessions and try again."
-        )
+        detail = "\n".join(f"    pid {pid}: {cmd}" for pid, cmd in live)
+        if args.dry_run:
+            out.warn(
+                "Codex is running in this project - a real run would refuse:\n"
+                + detail
+            )
+        else:
+            out.error(
+                "Codex is running in this project - refusing to touch its data.\n"
+                + detail
+                + "\n  Close those sessions and try again."
+            )
 
     # ------------------------------------------------------- gather work ----
     rollouts = []

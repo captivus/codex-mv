@@ -13,6 +13,7 @@ Two layers:
 The behavioural tests are skipped automatically when the codex CLI is absent.
 """
 
+import importlib.machinery
 import json
 import os
 import queue
@@ -45,6 +46,25 @@ CREATE TABLE threads (
     preview TEXT NOT NULL DEFAULT 'hello'
 );
 """
+
+
+_MODULE = None
+
+
+def codex_mv_module():
+    """Import the tool as a module so helpers can be unit-tested directly.
+
+    It has no .py extension, being a CLI, so load it by path.
+    """
+    global _MODULE
+    if _MODULE is None:
+        import importlib.util
+        spec = importlib.util.spec_from_loader(
+            "codex_mv",
+            importlib.machinery.SourceFileLoader("codex_mv", CODEX_MV))
+        _MODULE = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_MODULE)
+    return _MODULE
 
 
 def run_codex_mv(*args):
@@ -382,6 +402,72 @@ class StructuralTests(unittest.TestCase):
         r = run_codex_mv("--undo", empty, "-y", "--no-color")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("No manifest.json", r.stderr)
+
+    def test_dry_run_previews_the_backup(self):
+        """The backup is the expensive part; you should see it before running.
+
+        Asserts the reported figures against the real files, not just that the
+        labels appear - a preview that prints plausible-looking numbers it did
+        not measure is worse than none.
+        """
+        f = Fixture(self.tmp)
+        # pad the transcript so its size is unmistakable in the output
+        with open(f.rollout, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "event_msg",
+                                 "payload": {"type": "token_count",
+                                             "pad": "x" * 300_000}}) + "\n")
+        rollout_bytes = os.path.getsize(f.rollout)
+        db_bytes = os.path.getsize(f.db)
+
+        r = run_codex_mv("--codex-home", f.home, "--dry-run", "--no-color",
+                         f.old, f.new)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Backup", r.stderr)
+        self.assertIn("manifest.json (1 entries)", r.stderr)
+
+        self.assertIn(codex_mv_module().human_size(rollout_bytes), r.stderr,
+                      "transcript size must be measured, not invented")
+        self.assertIn("transcripts are not copied", r.stderr)
+        self.assertIn(codex_mv_module().human_size(db_bytes), r.stderr,
+                      "state DB size must be measured")
+
+    def test_backup_preview_measures_real_sizes(self):
+        mod = codex_mv_module()
+        f = Fixture(self.tmp)
+        preview = mod.backup_preview(
+            f.home, [(f.rollout, f.session_cwd)], f.db, f.config, [(0, f.old)])
+        self.assertEqual(preview["transcripts"], os.path.getsize(f.rollout))
+        self.assertGreaterEqual(preview["total"], os.path.getsize(f.db))
+        # the manifest must be far smaller than the transcripts it describes
+        self.assertLess(preview["total"] - os.path.getsize(f.db), 10_000)
+
+    def test_guard_groups_processes_into_sessions(self):
+        """One Codex session is several processes; report sessions, not pids."""
+        f = Fixture(self.tmp)
+        inner_dir = os.path.join(self.tmp, "inner")
+        outer_dir = os.path.join(self.tmp, "outer")
+        os.makedirs(inner_dir, exist_ok=True)
+        os.makedirs(outer_dir, exist_ok=True)
+        inner = os.path.join(inner_dir, "codex")
+        outer = os.path.join(outer_dir, "codex")
+        with open(inner, "w") as fh:
+            fh.write("#!/bin/sh\nsleep 30\n")
+        # the outer process stays alive with the inner one as its child,
+        # mirroring codex's node wrapper plus platform binary
+        with open(outer, "w") as fh:
+            fh.write(f'#!/bin/sh\n"{inner}" &\nwait\n')
+        for path in (inner, outer):
+            os.chmod(path, 0o755)
+        proc = subprocess.Popen([outer], cwd=f.old,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.5)
+            r = f.run()
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("1 session(s), 2 process(es)", r.stderr)
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_refuses_when_codex_is_live_in_the_project(self):
         f = Fixture(self.tmp)

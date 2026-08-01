@@ -153,6 +153,73 @@ def session_meta_cwd(path, max_scan=10):
 
 
 # --------------------------------------------------------- live processes ----
+def _proc_stat(pid):
+    """(ppid, tty_nr) from /proc/<pid>/stat, or (None, None).
+
+    The comm field can contain spaces and parentheses, so parse after the last
+    ')' rather than splitting the whole line.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+    except OSError:
+        return None, None
+    try:
+        rest = data[data.rindex(")") + 2:].split()
+        return int(rest[1]), int(rest[4])
+    except (ValueError, IndexError):
+        return None, None
+
+
+def _proc_rollout(pid):
+    """The rollout file this process holds open, if any.
+
+    A live Codex session keeps its rollout open for appending, which is what
+    ties a process back to a nameable conversation.
+    """
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return None
+    for name in names:
+        try:
+            target = os.readlink(os.path.join(fd_dir, name))
+        except OSError:
+            continue
+        if target.endswith(".jsonl") and f"{os.sep}sessions{os.sep}" in target:
+            return target
+    return None
+
+
+def _session_id_from_rollout(path):
+    m = re.search(r"rollout-.*?-([0-9a-fA-F-]{36})\.jsonl$", os.path.basename(path))
+    return m.group(1) if m else None
+
+
+def _thread_label(db, session_id):
+    """(label, last_activity) for a session, from the state DB."""
+    if not db or not session_id or not os.path.exists(db):
+        return None, None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None, None
+    try:
+        row = con.execute(
+            "SELECT COALESCE(NULLIF(name,''), NULLIF(title,''), NULLIF(preview,''), ''),"
+            " datetime(updated_at,'unixepoch','localtime')"
+            " FROM threads WHERE id = ?", (session_id,)).fetchone()
+    except sqlite3.Error:
+        return None, None
+    finally:
+        con.close()
+    if not row:
+        return None, None
+    label = " ".join((row[0] or "").split())
+    return (label or None), row[1]
+
+
 def live_codex_processes(target):
     """Codex processes currently working inside `target`.
 
@@ -191,8 +258,114 @@ def live_codex_processes(target):
             is_under(a, target) for a in args if a.startswith("/")
         )
         if bound:
-            found.append((pid, " ".join(args)[:110]))
+            ppid, tty = _proc_stat(pid)
+            found.append({
+                "pid": pid, "ppid": ppid, "tty": tty, "cwd": cwd,
+                "cmd": " ".join(args),
+                "rollout": _proc_rollout(pid),
+                "started": _start_time(pid),
+            })
     return found
+
+
+def _boot_time():
+    """Epoch seconds at which the machine booted, from /proc/stat."""
+    try:
+        with open("/proc/stat", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _start_time(pid, boot=None):
+    """When the process actually started.
+
+    Derived from field 22 of /proc/<pid>/stat (start time in clock ticks since
+    boot). The mtime of /proc/<pid> is not the process start time - it moves,
+    and reports a time hours or days later.
+    """
+    boot = boot if boot is not None else _boot_time()
+    if boot is None:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+        rest = data[data.rindex(")") + 2:].split()
+        ticks = int(rest[19])  # field 22 overall
+    except (OSError, ValueError, IndexError):
+        return None
+    hz = os.sysconf("SC_CLK_TCK") or 100
+    return datetime.fromtimestamp(boot + ticks / hz)
+
+
+def group_sessions(procs, db):
+    """Collapse Codex processes into the sessions a user would actually close.
+
+    One session shows up as several processes - a node wrapper, the platform
+    binary, and anything it spawned - so listing pids alone overstates how much
+    there is to close. Group each process under its topmost Codex ancestor, and
+    label the group with the terminal it is attached to and the conversation it
+    has open, which is what makes it findable.
+    """
+    by_pid = {p["pid"]: p for p in procs}
+
+    def root_of(proc):
+        seen = set()
+        cur = proc
+        while cur["ppid"] in by_pid and cur["pid"] not in seen:
+            seen.add(cur["pid"])
+            cur = by_pid[cur["ppid"]]
+        return cur["pid"]
+
+    groups = {}
+    for proc in procs:
+        groups.setdefault(root_of(proc), []).append(proc)
+
+    sessions = []
+    for root, members in sorted(groups.items()):
+        rollout = next((m["rollout"] for m in members if m["rollout"]), None)
+        sid = _session_id_from_rollout(rollout) if rollout else None
+        label, last = _thread_label(db, sid)
+        tty = next((m["tty"] for m in members if m["tty"]), None)
+        started = min((m["started"] for m in members if m["started"]), default=None)
+        sessions.append({
+            "root": root,
+            "pids": sorted(m["pid"] for m in members),
+            "tty": f"pts/{tty & 0xff}" if tty else None,
+            "cwd": next((m["cwd"] for m in members if m["cwd"]), None),
+            "session_id": sid,
+            "label": label,
+            "last_activity": last,
+            "started": started,
+        })
+    return sessions
+
+
+def format_sessions(sessions, procs):
+    """Human-findable description of the sessions blocking a run."""
+    lines = [
+        f"  {len(sessions)} session(s), {len(procs)} process(es):"
+    ]
+    for i, s in enumerate(sessions, 1):
+        where = s["tty"] or "no terminal"
+        started = s["started"].strftime("%Y-%m-%d %H:%M") if s["started"] else "?"
+        others = ", ".join(str(p) for p in s["pids"] if p != s["root"])
+        lines.append(f"    [{i}] {where}  started {started}  pid {s['root']}"
+                     + (f" (+{len(s['pids']) - 1} more: {others})"
+                        if others else ""))
+        if s["cwd"]:
+            lines.append(f"        cwd     : {s['cwd']}")
+        if s["session_id"]:
+            lines.append(f"        session : {s['session_id'][:8]}"
+                         + (f"  last active {s['last_activity']}"
+                            if s["last_activity"] else ""))
+        if s["label"]:
+            snippet = s["label"][:96] + ("..." if len(s["label"]) > 96 else "")
+            lines.append(f'        about   : "{snippet}"')
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ edits ----
@@ -339,6 +512,47 @@ def update_config(config_path, old, new):
 MANIFEST_VERSION = 1
 
 
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def backup_preview(home, rollouts, db, config_path, trust):
+    """What the backup will cost, so --dry-run can show it before committing.
+
+    Reports the transcript bytes deliberately left in place as well: on a large
+    project that is the difference between a manifest and hundreds of MB.
+    """
+    copied, parts = 0, []
+    if db:
+        db_bytes = sum(_size(db + s) for s in ("", "-wal", "-shm"))
+        copied += db_bytes
+        parts.append(f"{os.path.basename(db)} {human_size(db_bytes)}")
+    if trust:
+        cfg = _size(config_path)
+        copied += cfg
+        parts.append(f"config.toml {human_size(cfg)}")
+    transcripts = sum(_size(path) for path, _cwd in rollouts)
+    # a manifest entry is roughly a path plus a cwd
+    manifest = sum(len(path) + len(cwd) + 40 for path, cwd in rollouts) + 200
+    return {
+        "dir": os.path.join(home, ".codex-mv-backups", "<timestamp>"),
+        "copied_desc": " + ".join(parts) if parts else "nothing else",
+        "total": copied + manifest,
+        "transcripts": transcripts,
+    }
+
+
 def write_backup(home, old, new, rollouts, db, config_path, trust):
     """Record enough to reverse the edit, without copying whole transcripts.
 
@@ -408,7 +622,7 @@ def undo(backup_dir, out, assume_yes):
     if live:
         out.error(
             "Codex is running in this project - refusing to touch its data.\n"
-            + "\n".join(f"    pid {pid}: {cmd}" for pid, cmd in live)
+            + format_sessions(group_sessions(live, state_db(home)), live)
         )
 
     if not assume_yes:
@@ -503,7 +717,7 @@ def main(argv=None):
     # A dry run writes nothing, so a live session is only a warning there.
     live = live_codex_processes(old)
     if live:
-        detail = "\n".join(f"    pid {pid}: {cmd}" for pid, cmd in live)
+        detail = format_sessions(group_sessions(live, state_db(home)), live)
         if args.dry_run:
             out.warn(
                 "Codex is running in this project - a real run would refuse:\n"
@@ -551,6 +765,14 @@ def main(argv=None):
         )
 
     if args.dry_run:
+        if not args.no_backup and (rollouts or rows or trust):
+            preview = backup_preview(home, rollouts, db, config_path, trust)
+            out.info(f"  Backup       : {preview['dir']}")
+            out.info(f"                 manifest.json ({len(rollouts)} entries)"
+                     f" + {preview['copied_desc']}"
+                     f"  ~= {human_size(preview['total'])}")
+            out.info("                 transcripts are not copied"
+                     f" ({human_size(preview['transcripts'])} left in place)")
         out.info("Dry-run complete - no changes made.")
         return 0
 

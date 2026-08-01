@@ -87,6 +87,9 @@ Planned actions:
                  ...
   State DB     : 3 thread row(s) in state_5.sqlite
   Trust entries: 1 in config.toml
+  Backup       : /home/alice/.codex/.codex-mv-backups/<timestamp>
+                 manifest.json (3 entries) + state_5.sqlite 9.6 MB + config.toml 4.0 KB  ~= 9.6 MB
+                 transcripts are not copied (545.3 MB left in place)
 Dry-run complete - no changes made.
 ```
 
@@ -99,8 +102,23 @@ moves a folder.
 
 So `codex-mv`:
 
-1. **Refuses to run** if a Codex process is working inside the target directory,
-   naming the offending pids.
+1. **Refuses to run** if a Codex session is working inside the target
+   directory, and tells you enough to find it. One session is several
+   processes -- a node wrapper, the platform binary, anything it spawned -- so
+   they are grouped into sessions, each labelled with the terminal it is
+   attached to, when it started, and what the conversation is about:
+
+   ```
+   ! Codex is running in this project - a real run would refuse:
+     2 session(s), 5 process(es):
+       [1] pts/20  started 2026-07-28 14:24  pid 684732 (+1 more: 684742)
+           cwd     : /home/alice/projects/my-project
+           session : 019f8679  last active 2026-07-28 14:57:02
+           about   : "So I'm building a pickleball league. It's called Kitchen..."
+   ```
+
+   The conversation label comes from the state DB, matched to the process via
+   the rollout file it holds open.
 2. **Records how to reverse itself first**, into
    `~/.codex/.codex-mv-backups/<timestamp>/`, and prints the path. The state DB
    (plus `-wal`/`-shm`) and `config.toml` are copied in full; the sessions are
@@ -166,6 +184,8 @@ Verified automatically, on every run:
 - dry run changes nothing (checked by checksum)
 - the live-session guard refuses a real run and only warns on a dry run
 - the backup records a reversible manifest rather than copying transcripts
+- the dry run previews the backup, with sizes measured from the real files
+- the guard groups processes into the sessions you would actually close
 - **`--undo` puts everything back**: directory, every session's recorded `cwd`,
   the state DB rows, and the trust entry
 - **the renamed project's sessions come back from `thread/list`**, through both

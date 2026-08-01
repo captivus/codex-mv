@@ -143,6 +143,14 @@ Sessions recorded in a *subdirectory* of the project (`OLD/sub`) are remapped to
 `NEW/sub`. Sibling paths that merely share a prefix (`/x/proj-other` when
 renaming `/x/proj`) are left alone.
 
+## For orchestrators
+
+`describe_live(target)` returns the same session description the tool prints
+for itself - terminal, start time, and what the conversation is about - or
+`None` when nothing is live. [`agent-mv`](https://github.com/captivus/agent-mv)
+imports this file and calls it, so there is one implementation of session
+identification rather than two that drift.
+
 ## Composing with other agents
 
 A project can carry history for more than one agent. `--no-move` exists for

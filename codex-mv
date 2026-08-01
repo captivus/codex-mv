@@ -355,6 +355,20 @@ def group_sessions(procs, db):
     return sessions
 
 
+def describe_live(target, codex_home=None):
+    """Rich description of the Codex sessions live in `target`, or None.
+
+    Exposed for orchestrators such as agent-mv: they can import this file and
+    get the same session identification the tool prints for itself, rather
+    than reimplementing it and drifting. Returning None means nothing is live.
+    """
+    procs = live_codex_processes(target)
+    if not procs:
+        return None
+    home = codex_home or default_codex_home()
+    return format_sessions(group_sessions(procs, state_db(home)), procs)
+
+
 def format_sessions(sessions, procs):
     """Human-findable description of the sessions blocking a run."""
     lines = [

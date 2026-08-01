@@ -217,7 +217,13 @@ Verified automatically, on every run:
 - the live-session guard refuses a real run and only warns on a dry run
 - the backup records a reversible manifest rather than copying transcripts
 - the dry run previews the backup, with sizes measured from the real files
-- the guard groups processes into the sessions you would actually close
+- the guard groups processes into the sessions you would actually close, and
+  prints how to find and close each one
+- the shared state DB is updated even while another project's session writes to
+  it, and a lock is never mistaken for "no rows"
+- a session resumed from a *different* directory is still caught, since it
+  appends to this project's rollout
+- `--no-move` repoints an already-moved directory, and still guards the new path
 - **`--undo` puts everything back**: directory, every session's recorded `cwd`,
   the state DB rows, and the trust entry
 - **the renamed project's sessions come back from `thread/list`**, through both
@@ -226,8 +232,10 @@ Verified automatically, on every run:
 
 The suite has been mutation-tested: skipping the sqlite update, skipping the
 rollout rewrite, dropping the path-separator boundary check, rewriting the whole
-file, breaking the undo restore, and recording the wrong `cwd` in the manifest
-each cause failures in the tests that should catch them.
+file, breaking the undo restore, recording the wrong `cwd` in the manifest,
+fabricating the dry-run backup figures, not grouping processes into sessions,
+and dropping the find-and-close guidance each cause failures in the tests that
+should catch them.
 
 Verified once, by hand, not automated:
 

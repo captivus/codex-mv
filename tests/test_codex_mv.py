@@ -587,6 +587,40 @@ class StructuralTests(unittest.TestCase):
             open(stop, "w").close()
             writer.wait(timeout=15)
 
+    def test_guard_tells_you_how_to_find_and_close_the_session(self):
+        """Knowing a session blocks you is only half of it.
+
+        A terminal multiplexed into one emulator process cannot be located
+        from its pts alone, so the guard must hand over the commands.
+        """
+        f = Fixture(self.tmp)
+        fake_bin = os.path.join(self.tmp, "fakebin5")
+        os.makedirs(fake_bin, exist_ok=True)
+        fake = os.path.join(fake_bin, "codex")
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\nsleep 30\n")
+        os.chmod(fake, 0o755)
+        # a controlling terminal, so the "find it" hint has something to name
+        try:
+            import pty
+            primary, secondary = pty.openpty()
+        except Exception:  # noqa: BLE001
+            self.skipTest("no pty available")
+        proc = subprocess.Popen([fake], cwd=f.old, stdin=secondary,
+                                stdout=secondary, stderr=secondary,
+                                start_new_session=True)
+        try:
+            time.sleep(0.4)
+            r = f.run()
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(f"close it: kill", r.stderr)
+            self.assertIn(str(proc.pid), r.stderr)
+        finally:
+            proc.kill()
+            proc.wait()
+            os.close(primary)
+            os.close(secondary)
+
     def test_refuses_when_codex_is_live_in_the_project(self):
         f = Fixture(self.tmp)
         fake_bin = os.path.join(self.tmp, "fakebin")

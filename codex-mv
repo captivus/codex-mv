@@ -390,6 +390,13 @@ def format_sessions(sessions, procs):
         if s["label"]:
             snippet = s["label"][:96] + ("..." if len(s["label"]) > 96 else "")
             lines.append(f'        about   : "{snippet}"')
+        # Knowing a session blocks you is only half of it. A terminal
+        # multiplexed into one emulator process cannot be located from its
+        # pts alone, so hand over the two commands that actually resolve it.
+        if s["tty"]:
+            lines.append(f"        find it : echo '>>> close this one <<<'"
+                         f" > /dev/{s['tty']}")
+        lines.append(f"        close it: kill {s['root']}")
     return "\n".join(lines)
 
 

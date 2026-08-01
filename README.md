@@ -119,7 +119,17 @@ So `codex-mv`:
    ```
 
    The conversation label comes from the state DB, matched to the process via
-   the rollout file it holds open.
+   the rollout file it holds open. Each session also carries the two commands
+   that resolve it — a terminal multiplexed into one emulator process cannot be
+   located from its `pts` alone:
+
+   ```
+           find it : echo '>>> close this one <<<' > /dev/pts/21
+           close it: kill 698721
+   ```
+
+   `find it` prints a marker into that terminal so you can spot the window;
+   `close it` ends the session the same way closing the tab would.
 2. **Records how to reverse itself first**, into
    `~/.codex/.codex-mv-backups/<timestamp>/`, and prints the path. The state DB
    (plus `-wal`/`-shm`) and `config.toml` are copied in full; the sessions are

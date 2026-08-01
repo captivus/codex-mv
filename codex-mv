@@ -12,6 +12,8 @@ Options:
                           it printed.
   -y, --yes               Skip the confirmation prompt (assume "yes").
       --codex-home PATH   Use PATH instead of $CODEX_HOME / ~/.codex.
+      --no-move           Repoint history only; the directory has already
+                          been moved (used by agent-mv).
       --no-backup         Skip the pre-flight backup (not recommended).
       --no-color          Disable ANSI colour output.
   -h, --help              Display this help.
@@ -735,6 +737,7 @@ def main(argv=None):
     parser.add_argument("-y", "--yes", action="store_true")
     parser.add_argument("--codex-home")
     parser.add_argument("--undo")
+    parser.add_argument("--no-move", action="store_true")
     parser.add_argument("--no-backup", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--version", action="store_true")
@@ -762,18 +765,26 @@ def main(argv=None):
     # ------------------------------------------------------- validation ----
     if old == new:
         out.error("OLD_PATH and NEW_PATH are identical.")
-    if not os.path.isdir(old):
-        out.error(f"Source directory not found: {old}")
-    if os.path.exists(new):
-        out.error(f"Destination already exists: {new}")
     if is_under(new, old):
         out.error("NEW_PATH cannot be inside OLD_PATH.")
+    if args.no_move:
+        # the caller has already moved the directory, so OLD is gone by now
+        if not os.path.isdir(new):
+            out.error(f"Destination directory not found: {new}")
+    else:
+        if not os.path.isdir(old):
+            out.error(f"Source directory not found: {old}")
+        if os.path.exists(new):
+            out.error(f"Destination already exists: {new}")
     if not os.path.isdir(home):
         out.warn(f"No Codex home at {home} - only the directory will be renamed.")
 
     # ------------------------------------------------ live-session guard ----
     # A dry run writes nothing, so a live session is only a warning there.
     live = live_codex_processes(old)
+    if args.no_move:
+        seen = {p["pid"] for p in live}
+        live += [p for p in live_codex_processes(new) if p["pid"] not in seen]
     if live:
         detail = format_sessions(group_sessions(live, state_db(home)), live)
         if args.dry_run:
@@ -802,7 +813,10 @@ def main(argv=None):
 
     # ------------------------------------------------------------ report ----
     out.info("Planned actions:")
-    out.info(f"  Project dir  : {old} -> {new}")
+    if args.no_move:
+        out.info(f"  Project dir  : {old} -> {new}  (already moved)")
+    else:
+        out.info(f"  Project dir  : {old} -> {new}")
     if rollouts:
         out.info(f"  Sessions     : {len(rollouts)} rollout file(s) to repoint")
         for path, cwd in rollouts[:10]:
@@ -858,11 +872,14 @@ def main(argv=None):
     if here and is_under(here, old):
         os.chdir("/")
 
-    try:
-        shutil.move(old, new)
-    except OSError as exc:
-        out.error(f"Could not rename project directory: {exc}")
-    out.success("Project directory renamed.")
+    if args.no_move:
+        out.info("Directory move skipped (--no-move).")
+    else:
+        try:
+            shutil.move(old, new)
+        except OSError as exc:
+            out.error(f"Could not rename project directory: {exc}")
+        out.success("Project directory renamed.")
 
     # ------------------------------------------------------------- edits ----
     try:

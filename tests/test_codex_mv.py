@@ -632,6 +632,51 @@ class StructuralTests(unittest.TestCase):
             proc.kill()
             proc.wait()
 
+    def test_no_move_repoints_history_for_an_already_moved_directory(self):
+        """agent-mv moves the directory once, then delegates the repointing."""
+        f = Fixture(self.tmp)
+        shutil.move(f.old, f.new)  # the caller has already moved it
+        r = run_codex_mv("--codex-home", f.home, "-y", "--no-color",
+                         "--no-move", f.old, f.new)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Directory move skipped", r.stderr)
+        self.assertEqual(meta_cwd(f.rollout), f.new)
+        self.assertEqual(db_cwds(f.db), [f.new])
+        with open(f.config, encoding="utf-8") as fh:
+            self.assertIn(f'[projects."{f.new}"]', fh.read())
+        self.assertTrue(os.path.isdir(f.new), "must not touch the directory")
+
+    def test_no_move_requires_the_destination_to_exist(self):
+        f = Fixture(self.tmp)
+        r = run_codex_mv("--codex-home", f.home, "-y", "--no-color",
+                         "--no-move", f.old, f.new)
+        self.assertNotEqual(r.returncode, 0, "destination has not been created")
+        self.assertIn("Destination directory not found", r.stderr)
+
+    def test_no_move_guards_the_new_path_too(self):
+        """After a move, a live process's cwd resolves to the NEW path."""
+        f = Fixture(self.tmp)
+        shutil.move(f.old, f.new)
+        fake_bin = os.path.join(self.tmp, "fakebin4")
+        os.makedirs(fake_bin, exist_ok=True)
+        fake = os.path.join(fake_bin, "codex")
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\nsleep 30\n")
+        os.chmod(fake, 0o755)
+        proc = subprocess.Popen([fake], cwd=f.new,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.4)
+            r = run_codex_mv("--codex-home", f.home, "-y", "--no-color",
+                             "--no-move", f.old, f.new)
+            self.assertNotEqual(r.returncode, 0,
+                                "a session live in the moved directory must block")
+            self.assertIn("Codex is running", r.stderr)
+            self.assertEqual(meta_cwd(f.rollout), f.session_cwd)
+        finally:
+            proc.kill()
+            proc.wait()
+
     def test_missing_source(self):
         f = Fixture(self.tmp)
         r = run_codex_mv("--codex-home", f.home, "-y", "--no-color",

@@ -68,6 +68,7 @@ codex-mv [options] OLD_PATH NEW_PATH
 | `-y`, `--yes` | Skip the confirmation prompt |
 | `--codex-home PATH` | Use `PATH` instead of `$CODEX_HOME` / `~/.codex` |
 | `--undo DIR` | Reverse a previous run, using the backup directory it printed |
+| `--no-move` | Repoint history only, for a directory that has already been moved (used by `agent-mv`) |
 | `--no-backup` | Skip the pre-flight backup (not recommended) |
 | `--no-color` | Disable coloured output |
 | `-h`, `--help` | Show help |
@@ -141,6 +142,19 @@ So `codex-mv`:
 Sessions recorded in a *subdirectory* of the project (`OLD/sub`) are remapped to
 `NEW/sub`. Sibling paths that merely share a prefix (`/x/proj-other` when
 renaming `/x/proj`) are left alone.
+
+## Composing with other agents
+
+A project can carry history for more than one agent. `--no-move` exists for
+that case: the caller moves the directory once, then each agent's own tool
+repoints its own state.
+
+[`agent-mv`](https://github.com/captivus/agent-mv) does exactly this across
+Claude Code and Codex. Run it instead of this tool when a project has both.
+
+Note that after the directory has moved, a live session's `/proc/<pid>/cwd`
+resolves to the *new* path, so under `--no-move` the live-session guard checks
+both paths.
 
 ## Installation
 

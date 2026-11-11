@@ -221,6 +221,23 @@ def meta_cwd(rollout_path):
         return json.loads(fh.readline())["payload"]["cwd"]
 
 
+def records(rollout_path):
+    with open(rollout_path, encoding="utf-8") as fh:
+        return [json.loads(l) for l in fh if l.strip()]
+
+
+def turn_cwds(rollout_path):
+    return [r["payload"]["cwd"] for r in records(rollout_path)
+            if r.get("type") == "turn_context"]
+
+
+def set_workspace_roots(rollout_path, roots):
+    recs = records(rollout_path)
+    recs[0]["payload"]["runtime_workspace_roots"] = roots
+    with open(rollout_path, "w", encoding="utf-8") as fh:
+        fh.writelines(json.dumps(r) + "\n" for r in recs)
+
+
 def db_cwds(db):
     con = sqlite3.connect(db)
     try:
@@ -281,14 +298,82 @@ class StructuralTests(unittest.TestCase):
         self.assertIn("a comment that must survive", cfg)
 
     def test_transcript_body_is_left_untouched(self):
-        """The body is a historical record; Codex re-announces cwd on resume."""
+        """Messages and tool output are a historical record; Codex re-announces
+        cwd on resume. Only location metadata records may change."""
         f = Fixture(self.tmp)
         f.run()
-        with open(f.rollout, encoding="utf-8") as fh:
-            lines = fh.readlines()
-        body = "".join(lines[1:])
-        self.assertIn(f.old, body, "stale body refs must be preserved")
-        self.assertNotIn(f.new, body, "codex-mv must not rewrite history")
+        conversation = "".join(
+            json.dumps(r) for r in records(f.rollout)
+            if r.get("type") not in ("session_meta", "turn_context"))
+        self.assertIn(f.old, conversation, "stale body refs must be preserved")
+        self.assertNotIn(f.new, conversation, "codex-mv must not rewrite history")
+
+    def test_turn_context_is_repointed(self):
+        """Paginated rollouts record cwd on every turn, and
+        `codex exec resume --last` matches the latest turn_context.cwd, not
+        session_meta - so a session repointed only in session_meta is
+        invisible to --last from the new directory."""
+        f = Fixture(self.tmp, sub="nested")
+        r = f.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(turn_cwds(f.rollout), [os.path.join(f.new, "nested")])
+
+    def test_runtime_workspace_roots_are_repointed(self):
+        f = Fixture(self.tmp)
+        set_workspace_roots(f.rollout, [f.old, f.old + "/.git", "/elsewhere"])
+        f.run()
+        meta = records(f.rollout)[0]["payload"]
+        self.assertEqual(meta["runtime_workspace_roots"],
+                         [f.new, f.new + "/.git", "/elsewhere"])
+
+    def test_rerun_repairs_a_half_repointed_session(self):
+        """An earlier codex-mv moved session_meta but left turn_context behind.
+        Running it again with --no-move must finish the job."""
+        f = Fixture(self.tmp)
+        os.rename(f.old, f.new)
+        os.remove(f.rollout)
+        rollout = make_rollout(f.home, f.SESSION_ID, f.new, body_path=f.old)
+        r = run_codex_mv("--codex-home", f.home, "-y", "--no-color",
+                         "--no-move", f.old, f.new)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(meta_cwd(rollout), f.new)
+        self.assertEqual(turn_cwds(rollout), [f.new])
+        # --undo of the repair goes all the way back to OLD
+        with open(os.path.join(self.backup_dir(f), "manifest.json")) as fh:
+            self.assertEqual(json.load(fh)["rollouts"][0]["cwd"], f.old)
+
+    def test_session_started_elsewhere_is_found_through_the_db(self):
+        """`codex exec` launched from a scratch dir that then worked in the
+        project: session_meta points at the scratch dir, but the DB row and
+        turn_context point into the project. Its turns must follow the
+        project; its session_meta must not."""
+        f = Fixture(self.tmp)
+        scratch = os.path.join(self.tmp, "scratch")
+        sid = "019f0000-0000-7000-8000-000000000002"
+        rollout = make_rollout(f.home, sid, scratch, body_path=f.old)
+        con = sqlite3.connect(f.db)
+        with con:
+            con.execute("INSERT INTO threads (id, rollout_path, cwd) "
+                        "VALUES (?,?,?)", (sid, rollout, f.old))
+        con.close()
+        r = f.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(meta_cwd(rollout), scratch)
+        self.assertEqual(turn_cwds(rollout), [f.new])
+        r = run_codex_mv("--undo", self.backup_dir(f), "-y", "--no-color")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(meta_cwd(rollout), scratch)
+        self.assertEqual(turn_cwds(rollout), [f.old])
+
+    def test_backups_in_the_same_second_do_not_collide(self):
+        """A loop over projects can start two runs within one second; the
+        second must not overwrite the first's undo data."""
+        mod = codex_mv_module()
+        f = Fixture(self.tmp)
+        rollouts = [(f.rollout, f.old)]
+        dirs = {mod.write_backup(f.home, f.old, f.new, rollouts, f.db,
+                                 f.config, ["x"]) for _ in range(3)}
+        self.assertEqual(len(dirs), 3)
 
     def test_subdirectory_sessions_are_remapped(self):
         """A session recorded in OLD/sub must land in NEW/sub."""
@@ -384,6 +469,7 @@ class StructuralTests(unittest.TestCase):
         self.assertFalse(os.path.exists(f.new))
         self.assertTrue(os.path.exists(os.path.join(f.old, "marker.txt")))
         self.assertEqual(meta_cwd(f.rollout), f.session_cwd)
+        self.assertEqual(turn_cwds(f.rollout), [f.session_cwd])
         self.assertEqual(db_cwds(f.db), [f.session_cwd])
         self.assertEqual(open(f.config, encoding="utf-8").read(), before_cfg)
 

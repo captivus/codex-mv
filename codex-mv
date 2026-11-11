@@ -42,7 +42,7 @@ import tempfile
 import time
 from datetime import datetime
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------- output ----
@@ -401,16 +401,27 @@ def format_sessions(sessions, procs):
 
 
 # ------------------------------------------------------------------ edits ----
-def _rewrite_meta(path, pick):
-    """Stream the rollout, letting `pick(cwd)` supply a replacement cwd.
+def _rewrite_meta(path, pick, move):
+    """Stream the rollout, repointing the records that say where it runs.
 
-    `pick` returns the new value, or None to leave the record alone. Only
-    session_meta is considered; the transcript body is copied verbatim.
+    Three fields are location metadata rather than transcript:
+      session_meta.cwd                      - via `pick(cwd)`
+      session_meta.runtime_workspace_roots  - via `move(path)`, per entry
+      turn_context.cwd                      - via `move(path)`, every turn
+    Each callback returns the new value, or None to leave it alone. Every other
+    record is copied verbatim.
 
-    Verified: on resume Codex injects a fresh <environment_context> announcing
-    the current directory, so stale paths in the body are historical record and
-    do not affect where the resumed session operates. Rewriting them would
-    falsify the transcript for no benefit.
+    turn_context matters: newer ("paginated") rollouts record the cwd on every
+    turn, and `codex exec resume --last` matches the current directory against
+    the latest one, not session_meta. Repointing session_meta alone leaves such
+    sessions invisible to --last (verified on codex-cli 0.156.1), and a resumed
+    session would carry the old directory as its turn context. Legacy rollouts
+    resume either way, but are repointed the same for consistency.
+
+    Paths inside the conversation itself (messages, tool calls, outputs) are
+    historical record: on resume Codex injects a fresh <environment_context>
+    announcing the current directory, so they do not affect where the resumed
+    session operates. Rewriting them would falsify the transcript.
     """
     changed = False
     directory = os.path.dirname(path)
@@ -420,21 +431,38 @@ def _rewrite_meta(path, pick):
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     stripped = line.strip()
-                    if stripped:
+                    kind = None
+                    if stripped and ('"session_meta"' in stripped
+                                     or '"turn_context"' in stripped):
                         try:
                             obj = json.loads(stripped)
-                        except (ValueError, TypeError):
+                            kind = obj.get("type")
+                        except (ValueError, TypeError, AttributeError):
                             obj = None
-                        if obj is not None and obj.get("type") == "session_meta":
-                            payload = obj.get("payload") or {}
-                            cwd = payload.get("cwd")
-                            replacement = pick(cwd) if isinstance(cwd, str) else None
+                    if kind in ("session_meta", "turn_context"):
+                        payload = obj.get("payload") or {}
+                        hit = False
+                        cwd = payload.get("cwd")
+                        if isinstance(cwd, str):
+                            fn = pick if kind == "session_meta" else move
+                            replacement = fn(cwd)
                             if replacement is not None:
                                 payload["cwd"] = replacement
-                                obj["payload"] = payload
-                                out.write(json.dumps(obj) + "\n")
-                                changed = True
-                                continue
+                                hit = True
+                        roots = payload.get("runtime_workspace_roots")
+                        if kind == "session_meta" and isinstance(roots, list):
+                            moved = [move(r) if isinstance(r, str) else None
+                                     for r in roots]
+                            if any(m is not None for m in moved):
+                                payload["runtime_workspace_roots"] = [
+                                    m if m is not None else r
+                                    for r, m in zip(roots, moved)]
+                                hit = True
+                        if hit:
+                            obj["payload"] = payload
+                            out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                            changed = True
+                            continue
                     out.write(line if line.endswith("\n") else line + "\n")
         shutil.copystat(path, tmp)
         os.replace(tmp, path)
@@ -445,15 +473,53 @@ def _rewrite_meta(path, pick):
     return changed
 
 
+def _mover(old, new):
+    return lambda p: remap(p, old, new) if is_under(p, old) else None
+
+
 def rewrite_rollout(path, old, new):
     """Repoint a session from under `old` to under `new`."""
-    return _rewrite_meta(
-        path, lambda cwd: remap(cwd, old, new) if is_under(cwd, old) else None)
+    return _rewrite_meta(path, _mover(old, new), _mover(old, new))
 
 
-def set_rollout_cwd(path, value):
-    """Set a session's recorded cwd to exactly `value` (used by --undo)."""
-    return _rewrite_meta(path, lambda cwd: value if cwd != value else None)
+def set_rollout_cwd(path, value, old=None, new=None):
+    """Undo: set session_meta.cwd to exactly `value`, and move the other
+    location fields from under `new` back to under `old`."""
+    move = _mover(new, old) if old and new else (lambda p: None)
+    return _rewrite_meta(path, lambda cwd: value if cwd != value else None, move)
+
+
+def has_stale_location(path, old):
+    """True if any location field in the rollout still points under `old`.
+
+    Used to find sessions a previous run only half-repointed (session_meta
+    moved, turn_context not). A cheap substring test gates the JSON parse.
+    """
+    needles = {json.dumps(old)[1:-1], json.dumps(old, ensure_ascii=False)[1:-1]}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not any(n in line for n in needles):
+                    continue
+                if '"turn_context"' not in line and '"session_meta"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                payload = obj.get("payload") or {}
+                kind = obj.get("type")
+                if kind == "turn_context":
+                    cwd = payload.get("cwd")
+                    if isinstance(cwd, str) and is_under(cwd, old):
+                        return True
+                elif kind == "session_meta":
+                    for r in payload.get("runtime_workspace_roots") or []:
+                        if isinstance(r, str) and is_under(r, old):
+                            return True
+    except OSError:
+        return False
+    return False
 
 
 def db_rows_to_update(db, old, attempts=6, timeout=30.0):
@@ -478,6 +544,30 @@ def db_rows_to_update(db, old, attempts=6, timeout=30.0):
                     if isinstance(r["cwd"], str) and is_under(r["cwd"], old)]
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc):
+                return []
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 4.0)
+        finally:
+            con.close()
+    return []
+
+
+def db_rollout_paths(db, old, attempts=6, timeout=30.0):
+    """rollout_path of every thread row whose cwd is at or under `old`."""
+    if not db or not os.path.exists(db):
+        return []
+    delay = 0.25
+    for attempt in range(attempts):
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=timeout)
+        try:
+            rows = con.execute("SELECT cwd, rollout_path FROM threads").fetchall()
+            return [rp for cwd, rp in rows
+                    if isinstance(cwd, str) and isinstance(rp, str)
+                    and is_under(cwd, old)]
+        except sqlite3.OperationalError as exc:
+            if "no such" in str(exc):
                 return []
             if attempt == attempts - 1:
                 raise
@@ -627,7 +717,8 @@ def backup_preview(home, rollouts, db, config_path, trust):
 def write_backup(home, old, new, rollouts, db, config_path, trust):
     """Record enough to reverse the edit, without copying whole transcripts.
 
-    Only one field on line 1 of each rollout changes, and rollouts are written
+    Only location metadata changes (session_meta and turn_context records -
+    see _rewrite_meta), and rollouts are written
     atomically (temp file + os.replace), so a copy of the full transcript
     protects against nothing a manifest does not. On a real project that
     difference is hundreds of megabytes per run: 110 sessions of chat history
@@ -635,9 +726,19 @@ def write_backup(home, old, new, rollouts, db, config_path, trust):
 
     The state DB and config.toml are small and are copied in full.
     """
+    # Two runs in the same second (e.g. a loop over projects) must not share
+    # a directory, or the second silently overwrites the first's undo data.
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_dir = os.path.join(home, ".codex-mv-backups", stamp)
-    os.makedirs(backup_dir, exist_ok=True)
+    root = os.path.join(home, ".codex-mv-backups")
+    os.makedirs(root, exist_ok=True)
+    backup_dir, n = os.path.join(root, stamp), 1
+    while True:
+        try:
+            os.mkdir(backup_dir)
+            break
+        except FileExistsError:
+            n += 1
+            backup_dir = os.path.join(root, f"{stamp}-{n}")
 
     manifest = {
         "version": MANIFEST_VERSION,
@@ -727,7 +828,7 @@ def undo(backup_dir, out, assume_yes):
         if not os.path.exists(path):
             missing += 1
             continue
-        if set_rollout_cwd(path, cwd):
+        if set_rollout_cwd(path, cwd, old, new):
             restored += 1
     out.success(f"Restored {restored} session file(s).")
     if missing:
@@ -821,14 +922,37 @@ def main(argv=None):
             )
 
     # ------------------------------------------------------- gather work ----
-    rollouts = []
-    for path in rollout_files(home):
-        cwd = session_meta_cwd(path)
-        if cwd and is_under(cwd, old):
-            rollouts.append((path, cwd))
-
+    # A session belongs to this project if any of these hold:
+    #  - its session_meta.cwd is under OLD (the normal case);
+    #  - the state DB files it under OLD - the DB tracks the latest turn's
+    #    cwd, so this catches sessions started elsewhere (e.g. `codex exec`
+    #    launched from a scratch dir) that then worked in the project;
+    #  - session_meta (or its DB row) is already under NEW but turn_context/
+    #    workspace roots still point under OLD: an earlier codex-mv run that
+    #    predates turn_context handling. Re-running repairs it.
+    # The manifest records the cwd each session should return to on --undo.
     db = state_db(home)
     rows = db_rows_to_update(db, old)
+    db_paths = {os.path.realpath(p) for p in db_rollout_paths(db, old)}
+    db_paths_new = {os.path.realpath(p) for p in db_rollout_paths(db, new)}
+    rollouts, seen = [], set()
+    for path in rollout_files(home):
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        cwd = session_meta_cwd(path)
+        if not cwd:
+            continue
+        # what --undo restores session_meta.cwd to: where it was before
+        # any codex-mv run, even if an earlier run already moved it to NEW
+        original = cwd if is_under(cwd, old) else remap(cwd, new, old)
+        if is_under(cwd, old) or real in db_paths:
+            rollouts.append((path, original))
+            seen.add(real)
+        elif ((is_under(cwd, new) or real in db_paths_new)
+              and has_stale_location(path, old)):
+            rollouts.append((path, original))
+            seen.add(real)
     config_path = os.path.join(home, "config.toml")
     trust = config_entries(config_path, old)
 

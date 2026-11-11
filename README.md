@@ -35,6 +35,8 @@ has to update all three:
 | Store | Field | Why it matters |
 |---|---|---|
 | `sessions/**/rollout-*.jsonl` | `session_meta.cwd` | the source of truth |
+| ″ | `session_meta.runtime_workspace_roots` | the workspace roots the session ran with |
+| ″ | `turn_context.cwd`, on every turn | what `codex exec resume --last` matches |
 | `state_<N>.sqlite` | `threads.cwd` | what the picker reads |
 | `config.toml` | `[projects."<path>"]` | trust level / sandbox |
 
@@ -43,15 +45,28 @@ repairs the row straight back to the old path. Updating only the rollout leaves
 a stale cache that still surfaces through Codex's state-DB-only read path. Both
 are required, which is what this tool does.
 
+`turn_context` matters for newer ("paginated") rollouts, which record the cwd
+on every turn: `codex exec resume --last` matches the current directory against
+the latest `turn_context.cwd`, not `session_meta`. A session repointed only in
+`session_meta` still shows in the interactive picker but `--last` silently
+starts a fresh session instead (verified on codex-cli 0.156.1). Earlier
+versions of this tool had exactly that gap; re-running `codex-mv --no-move OLD
+NEW` repairs sessions they left half-repointed.
+
+A session is picked up if its `session_meta.cwd` is under OLD, **or** the state
+DB files it under OLD — which catches a `codex exec` started from a scratch
+directory that then worked in the project. Such a session keeps its own
+`session_meta.cwd`; only its turns follow the project.
+
 ## What it deliberately does **not** change
 
-The old path also appears throughout the transcript body — in recorded shell
-commands, their output, and earlier `<environment_context>` blocks. `codex-mv`
-leaves every one of those alone.
+The old path also appears throughout the conversation itself — in recorded
+shell commands, their output, and earlier `<environment_context>` blocks.
+`codex-mv` leaves every one of those alone. (`turn_context` records are not
+part of that: they are location metadata that is never shown to the model.)
 
 That is safe because when you resume, Codex injects a **fresh
-`<environment_context>` announcing the current directory**, and records a
-per-turn `turn_context` with it. The resumed session runs in the new directory
+`<environment_context>` announcing the current directory**. The resumed session runs in the new directory
 and the model is told so explicitly. The stale text is a historical record of
 what actually happened; rewriting it would make the transcript claim commands
 ran somewhere they never did.
@@ -131,12 +146,13 @@ So `codex-mv`:
    `find it` prints a marker into that terminal so you can spot the window;
    `close it` ends the session the same way closing the tab would.
 2. **Records how to reverse itself first**, into
-   `~/.codex/.codex-mv-backups/<timestamp>/`, and prints the path. The state DB
+   `~/.codex/.codex-mv-backups/<timestamp>/` (suffixed `-2`, `-3`, … when
+   runs land in the same second), and prints the path. The state DB
    (plus `-wal`/`-shm`) and `config.toml` are copied in full; the sessions are
    captured as a `manifest.json` listing each rollout and its original `cwd`.
 
-   Transcripts are deliberately *not* copied. Only one field on line 1 changes,
-   and rollouts are written atomically, so a full copy protects against nothing
+   Transcripts are deliberately *not* copied. Only location metadata changes
+   (`session_meta` and `turn_context` records), and rollouts are written atomically, so a full copy protects against nothing
    the manifest does not — and on a real project the difference is large: 110
    sessions of chat history is ~570 MB, against a manifest of a few tens of KB.
 
@@ -212,6 +228,11 @@ carried in this repo.
 Verified automatically, on every run:
 
 - the three stores are updated, and the transcript body is not
+- `turn_context.cwd` and `runtime_workspace_roots` follow the project, and a
+  re-run repairs sessions an earlier version left half-repointed
+- a session started elsewhere but filed under the project in the state DB has
+  its turns repointed and its own `session_meta.cwd` left alone
+- two runs in the same second get separate backup directories
 - subdirectory sessions are remapped; sibling paths sharing a prefix are not
 - dry run changes nothing (checked by checksum)
 - the live-session guard refuses a real run and only warns on a dry run
@@ -224,8 +245,8 @@ Verified automatically, on every run:
 - a session resumed from a *different* directory is still caught, since it
   appends to this project's rollout
 - `--no-move` repoints an already-moved directory, and still guards the new path
-- **`--undo` puts everything back**: directory, every session's recorded `cwd`,
-  the state DB rows, and the trust entry
+- **`--undo` puts everything back**: directory, every session's recorded `cwd`
+  and per-turn `turn_context`, the state DB rows, and the trust entry
 - **the renamed project's sessions come back from `thread/list`**, through both
   the default scan-and-repair path and `useStateDbOnly` — driven against a real
   `codex app-server`
